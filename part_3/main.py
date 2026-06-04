@@ -89,8 +89,8 @@ GROUP_BROADCAST_RE = re.compile(
 MAX_MESSAGES_TO_SEND = 20      # message budget for the whole session
 POLL_SECONDS = 4               # minimum sleep between hub polls (rate limit)
 MAX_CONTEXT_MESSAGES = 20      # rolling chat history size
-MAX_REPLY_CHARS = 1000         # hard cap on any single reply
-MAX_REPLY_TOKENS = 900         # hard cap on tokens for a single model reply
+MAX_REPLY_CHARS = 3500         # hard cap on any single reply (room for a code block)
+MAX_REPLY_TOKENS = 1500        # hard cap on tokens for a single model reply
 MAX_BACKOFF_SECONDS = 60       # cap for fetch backoff
 MAX_IMPORTANT_MEMORY = 30      # cap for preserved important messages
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5.4-mini")
@@ -442,10 +442,12 @@ def build_final_instruction(
         "whole plan. Keep it under 200 characters."
     )
     deliver_instruction = (
-        f"You already claimed this subtask: \"{my_last_task}\". You have NOT delivered it yet. "
-        "Deliver it NOW: reply starting with [WORKING] (or [FILE_PROPOSAL]) followed by a small, "
-        "correct, self-contained code block implementing ONLY your part. Do not claim anything "
-        "new in this same message, do not redo another agent's work. Keep it concise."
+        f"You already claimed this subtask: \"{my_last_task}\". Deliver it NOW in this one "
+        "message: start with [DONE], then one short sentence saying exactly what you changed, "
+        "then the full corrected, self-contained code in a single ``` code block implementing "
+        "ONLY your part. Never reply that you are 'still working' or 'not done yet' — you act "
+        "only by posting code here. Do not claim anything new and do not redo another agent's "
+        "work."
     )
     idle_instruction = (
         "A build session is active and you have already done your share of tasks. "
@@ -478,18 +480,24 @@ def build_final_instruction(
         return session_action()
 
     if directed_at_me:
-        if work_mode and WORK_ENABLED and pending_delivery and my_last_task:
+        if pending_delivery and my_last_task:
             return (
-                "You were addressed during an active build session and still owe your claimed "
-                + f"subtask: \"{my_last_task}\". " + deliver_instruction
+                f"You earlier claimed this subtask: \"{my_last_task}\" but have NOT delivered "
+                "it yet. You are a chat-only agent, so the ONLY way to make the change is to "
+                "post the corrected code here now. Reply starting with [DONE] and a one-sentence "
+                "summary of exactly what you changed, then the full corrected code in a single "
+                "``` code block. Do not say you are 'still working' and do not claim anything new."
             )
         return (
-            "The latest message directly mentions you or your alias. If it asks for code, "
-            "code review, debugging, SWE help, status, or collaboration, answer shortly and "
-            "usefully. Do not reply PASS unless the request is unsafe or completely unrelated "
-            "to software engineering. If asked to write code, write the code directly. "
-            "If asked to claim/take a task, reply with [CLAIM] and one small specific subtask "
-            f"that is not already claimed (already claimed: {roster})."
+            "The latest message directly mentions you or your alias. If it asks you to make, "
+            "fix, or implement a code change, do the ENTIRE task now in ONE message: start with "
+            "[CLAIM] and name the task in a few words, then on a new line [DONE] with a one-"
+            "sentence summary of exactly what you changed, then the full corrected code in a "
+            "single ``` code block. If it only asks for code review, debugging help, or status, "
+            "answer briefly. Never promise to do the work later or say you are 'still working' — "
+            "you can only act by posting in chat right now. Do not reply PASS unless the request "
+            "is unsafe or completely unrelated to software engineering. Tasks already claimed by "
+            f"the team (do NOT re-claim any of these): {roster}."
         )
 
     if group_work_request:
@@ -526,7 +534,8 @@ def build_final_instruction(
 
 def ask_model(system_prompt: str, messages: list, important_memory: list,
               work_mode: bool = False, can_claim_more: bool = False,
-              pending_delivery: bool = False, my_last_task: str = "") -> str:
+              pending_delivery: bool = False, my_last_task: str = "",
+              trigger_text: str | None = None, force_delivery: bool = False) -> str:
     conversation = [
         {
             "role": "system",
@@ -567,9 +576,14 @@ def ask_model(system_prompt: str, messages: list, important_memory: list,
             "content": f"[{agent_name}]: {content}",
         })
 
-    last_message_text = ""
-    if messages:
+    # Decide based on the message that actually triggered this turn, not just
+    # whatever happens to be last in history (which may be our own past message).
+    if trigger_text is not None:
+        last_message_text = trigger_text
+    elif messages:
         last_message_text = messages[-1].get("content", "")
+    else:
+        last_message_text = ""
 
     directed_at_me = is_directed_at_me(last_message_text)
     group_broadcast = is_group_broadcast(last_message_text)
@@ -609,6 +623,19 @@ def ask_model(system_prompt: str, messages: list, important_memory: list,
         group_work_request, work_mode, coordination, pending_delivery,
         can_claim_more, my_last_task, roster,
     )
+
+    if force_delivery:
+        # The agent has already claimed this subtask in an active, WORK_ENABLED
+        # build session. Bypass the default-silence bias and demand real code.
+        final_instruction = (
+            f"You are in an ACTIVE build session and you already claimed the subtask "
+            f"\"{my_last_task}\". WORK_ENABLED is true, so you are AUTHORIZED to deliver it now "
+            "without waiting for any manager. Deliver it in THIS message: start with [WORKING] "
+            "(or [FILE_PROPOSAL]), then a single self-contained Python code block implementing "
+            "ONLY your part, then one short line describing what it does. You MUST post real "
+            "code. Do NOT reply PASS. Do NOT ask questions. Do NOT claim anything new. Do NOT "
+            "restate the plan. Do NOT say you are 'still working'."
+        )
 
     conversation.append({
         "role": "user",
@@ -679,6 +706,19 @@ def main():
             log("Warning: Startup message failed to send.")
     else:
         log("Startup message skipped.")
+
+    # Prime the cursor so we only react to messages that arrive AFTER startup.
+    # Without this, last_seen=0 replays the whole hub history (including our own
+    # claims from a previous run) and the agent reacts to stale messages.
+    primer = fetch_messages(last_seen)
+    if primer:
+        last_seen = primer[-1].get("seq", last_seen)
+        history.extend(primer[-MAX_CONTEXT_MESSAGES:])
+        update_important_memory(important_memory, primer)
+        log(f"Primed on {len(primer)} existing message(s); only acting on new ones "
+            f"(last_seen={last_seen}).")
+    else:
+        log("No existing messages to prime from.")
 
     while True:
         while messages_sent < MAX_MESSAGES_TO_SEND and tokens_used < MAX_TOTAL_TOKENS:
@@ -764,7 +804,7 @@ def main():
             my_last_task = my_tasks[-1] if my_tasks else ""
             reply, used = ask_model(system_prompt, history, important_memory,
                                     work_mode, can_claim_more, pending_delivery,
-                                    my_last_task)
+                                    my_last_task, trigger_text=last_text)
             tokens_used += used
             log(f"Tokens this turn: {used} | Total: {tokens_used}/{MAX_TOTAL_TOKENS}")
             log(f"[Model reply]\n{reply}")
@@ -789,17 +829,67 @@ def main():
                 messages_sent += 1
                 log(f"Sent message {messages_sent}/{MAX_MESSAGES_TO_SEND}")
                 upper = reply.upper()
+                # A real delivery must contain actual code, not just a status word.
+                # This stops "[WORKING] not done yet" from being treated as delivered.
+                has_code = "```" in reply
+                delivered = has_code and (
+                    "[DONE]" in upper or "[WORKING]" in upper or "[FILE_PROPOSAL]" in upper
+                )
                 if "[CLAIM]" in upper:
                     tasks_claimed += 1
                     task = claim_text_from(reply)
                     if task:
                         my_tasks.append(task)
-                    pending_delivery = True
+                    # If this same message already delivers the code, nothing is owed.
+                    pending_delivery = not delivered
                     log(f"Task claimed {tasks_claimed}/{MAX_TASKS_PER_SESSION} "
-                        f"(now owe delivery): {task[:80]}")
-                elif pending_delivery and ("[WORKING]" in upper or "[FILE_PROPOSAL]" in upper):
+                        f"(delivered={delivered}): {task[:80]}")
+                elif pending_delivery and delivered:
                     pending_delivery = False
                     log("Delivered claimed task. Will look for the next unclaimed piece.")
+
+                # A bare [CLAIM] only reserves the task; the agent must not then go
+                # silent waiting for someone else to speak. Immediately follow up with
+                # the actual code so a claim is always paired with a delivery.
+                if (pending_delivery and my_tasks
+                        and messages_sent < MAX_MESSAGES_TO_SEND
+                        and tokens_used < MAX_TOTAL_TOKENS):
+                    deliver_task = my_tasks[-1]
+                    # Force the code out; retry once if the model still stalls/PASSes.
+                    for deliver_attempt in range(2):
+                        time.sleep(POLL_SECONDS)
+                        log(f"Auto-delivering claimed task (attempt {deliver_attempt + 1}/2): "
+                            f"{deliver_task[:80]}")
+                        deliver_reply, deliver_used = ask_model(
+                            system_prompt, history, important_memory,
+                            work_mode, can_claim_more=False, pending_delivery=True,
+                            my_last_task=deliver_task, trigger_text=last_text,
+                            force_delivery=True,
+                        )
+                        tokens_used += deliver_used
+                        log(f"Tokens this turn: {deliver_used} | "
+                            f"Total: {tokens_used}/{MAX_TOTAL_TOKENS}")
+                        log(f"[Model reply]\n{deliver_reply}")
+
+                        d_upper = deliver_reply.upper()
+                        has_code = "```" in deliver_reply and (
+                            "[DONE]" in d_upper or "[WORKING]" in d_upper
+                            or "[FILE_PROPOSAL]" in d_upper
+                        )
+
+                        if not has_code:
+                            log("Auto-delivery had no code; retrying." if deliver_attempt == 0
+                                else "Auto-delivery still had no code; will retry on next message.")
+                            if tokens_used >= MAX_TOTAL_TOKENS:
+                                break
+                            continue
+
+                        if post_message(deliver_reply):
+                            messages_sent += 1
+                            log(f"Sent message {messages_sent}/{MAX_MESSAGES_TO_SEND}")
+                            pending_delivery = False
+                            log("Delivered claimed task. Will look for the next unclaimed piece.")
+                        break
 
             time.sleep(POLL_SECONDS)
 
