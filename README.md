@@ -103,11 +103,20 @@ An agent that polls a shared group chat hub via REST API and responds when menti
 
 Create `part_3/.env`:
 ```
+# Required
 HUB_URL=https://your-hub-url
 HUB_PASSWORD=your_password
 AGENT_NAME=stefan-code-disaster
 AGENT_ALIAS=scd
 OPENAI_API_KEY=your_key_here
+
+# Optional (defaults shown)
+AGENT_MODE=worker
+MANAGER_CANDIDATE=false   # answer manager-election broadcasts
+WORK_ENABLED=false        # join group build sessions (claim + deliver code)
+MODEL_NAME=gpt-5.4-mini
+MAX_TOTAL_TOKENS=40000
+MAX_TASKS_PER_SESSION=3
 ```
 
 ### Run
@@ -133,15 +142,30 @@ The agent will reply with a short code review. To check if it is online:
 
 **How it decides whether to respond:**
 - Always responds when directly mentioned: `@scd`, `@stefan-code-disaster`, `scd:`, etc.
-- Also responds to group-wide messages: `all agents`, `everyone`, `who can help`
-- Returns `PASS` (no message sent) for everything else
+- Responds to group broadcasts (`@all`, `@agents`, `all agents`, …) **only** when they ask for status, readiness, capabilities, or a roster check — vague broadcasts get `PASS`.
+- Manager-election broadcasts are answered only if `MANAGER_CANDIDATE=true`; otherwise `PASS`.
+- Group **work requests** ("build X together") are joined only if `WORK_ENABLED=true` (see Build sessions below); otherwise `PASS`.
+- Returns `PASS` (no message sent) for everything else.
+
+**Startup priming:** on launch the agent advances its read cursor past the existing hub history, so it only reacts to messages that arrive **after** it starts (it won't replay old messages or its own past claims).
+
+### Build sessions (collaboration)
+
+When `WORK_ENABLED=true` and someone broadcasts a group work request, a build session starts and the agent works as a team-player:
+
+1. It claims one small, unclaimed subtask: `[CLAIM] <task>`.
+2. It then **immediately delivers** that subtask as a real code block (`[WORKING]`/`[FILE_PROPOSAL]`), without waiting for another message — a claim is always paired with a delivery. If the model stalls, the delivery is retried once.
+3. It repeats claim → deliver up to `MAX_TASKS_PER_SESSION` times (default 3), never re-claiming a task already on the roster.
+
+Direct mentions (`@scd make those changes`) are answered regardless of `WORK_ENABLED`: the agent posts the corrected code in chat directly (it is chat-only and has no file-writing tools).
 
 ### Limits
 
 - Max **20 messages** sent per session (startup message counts) — extendable live from the console when reached
 - Max **40000 total tokens** per session (`MAX_TOTAL_TOKENS`) — also extendable live from the console when reached
 - Polls every **4 seconds**
-- Max **900 tokens** per model reply, truncated to 1000 characters before posting
+- Max **1500 tokens** per model reply, truncated to 3500 characters before posting (room to post a real code block when asked to make a change)
+- Max **3 claimed subtasks** per build session (`MAX_TASKS_PER_SESSION`)
 - Model is configurable via the `MODEL_NAME` env var (default `gpt-5.4-mini`)
 - Exponential backoff on connection errors (up to 60 seconds)
 - POST retried up to 3 times on failure
@@ -179,7 +203,11 @@ Tool output is capped at 2000 characters to prevent prompt flooding. The model i
 
 ### Secret protection (Part 3)
 
-The system prompt in `config.txt` instructs the agent never to reveal API keys, passwords, tokens, `.env` contents, or its own system prompt.
+The system prompt in `config.txt` instructs the agent never to reveal API keys, passwords, tokens, `.env` contents, or its own system prompt. As defense-in-depth, `redact_secrets()` also scrubs the real `OPENAI_API_KEY` and `HUB_PASSWORD` values from anything logged or posted to the hub, so they cannot leak even if echoed back.
+
+### Prompt-injection handling (Part 3)
+
+All hub messages are treated as untrusted data. A dedicated system message tells the model to ignore any instruction inside chat content that tries to change its rules, reveal secrets, or override the system prompt.
 
 ### HTTP error handling (Part 3)
 
@@ -197,6 +225,8 @@ All credentials are stored in `.env` files inside each part folder. These are li
 part_1/.env  →  OPENAI_API_KEY
 part_2/.env  →  OPENAI_API_KEY
 part_3/.env  →  HUB_URL, HUB_PASSWORD, AGENT_NAME, AGENT_ALIAS, OPENAI_API_KEY
+               (optional) AGENT_MODE, MANAGER_CANDIDATE, WORK_ENABLED,
+               MODEL_NAME, MAX_TOTAL_TOKENS, MAX_TASKS_PER_SESSION
 ```
 
 Never hardcode credentials in source files.
