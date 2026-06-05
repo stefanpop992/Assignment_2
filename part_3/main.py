@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 
-# .env must win over any stale variables exported in the terminal.
+
 load_dotenv(override=True)
 
 
@@ -46,8 +46,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 DISPLAY_NAME = f"{AGENT_NAME} (@{AGENT_ALIAS})" if AGENT_ALIAS else AGENT_NAME
 
-# Defense-in-depth: scrub real secret values from anything we log or post,
-# so they can never leak even if the model or hub echoed them back.
+
 _SECRETS = [s for s in (OPENAI_API_KEY, HUB_PASSWORD) if s and len(s) >= 6]
 
 
@@ -61,7 +60,7 @@ def redact_secrets(text: str) -> str:
 
 
 def _build_directed_re() -> "re.Pattern":
-    # Word-boundary matching so bare name/alias don't match inside other words.
+   
     parts = [re.escape(f"@{AGENT_NAME}"), rf"\b{re.escape(AGENT_NAME)}\b"]
     if AGENT_ALIAS:
         parts += [
@@ -75,7 +74,7 @@ def _build_directed_re() -> "re.Pattern":
 
 DIRECTED_RE = _build_directed_re()
 
-# Word-boundary guards stop "install:" matching "all:", etc.
+
 GROUP_BROADCAST_RE = re.compile(
     "|".join([
         r"@agents", r"@all\b", r"@everyone",
@@ -96,19 +95,19 @@ MAX_IMPORTANT_MEMORY = 30      # cap for preserved important messages
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5.4-mini")
 
 try:
-    # Maximum total tokens the agent may spend this session. Acts as the
-    # hard spending cap; can be extended in real-time from the console.
+  
+    
     MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", "40000"))
 except ValueError:
     MAX_TOTAL_TOKENS = 40000
 
 try:
-    # How many subtasks the agent may claim+deliver in one build session.
+    
     MAX_TASKS_PER_SESSION = int(os.getenv("MAX_TASKS_PER_SESSION", "3"))
 except ValueError:
     MAX_TASKS_PER_SESSION = 3
 
-# Messages containing any of these are preserved in important_memory.
+
 IMPORTANT_KEYWORDS = [
     "manager", "protocol", "task", "assigned", "assignment",
     "start working", "do not start", "file_proposal", "code_review",
@@ -126,7 +125,7 @@ def safe_truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     cut = text[:limit].rstrip()
-    if cut.count("```") % 2 == 1:  # opened a code block but never closed it
+    if cut.count("```") % 2 == 1:  
         cut += "\n```"
     return cut + "\n...[truncated]"
 
@@ -179,7 +178,7 @@ def fetch_messages(since: int) -> list | None:
 
 
 def post_message(content: str) -> bool:
-    # Never let a secret value go out to the hub, even by accident.
+    
     content = redact_secrets(content)
     if len(content) > 4096:
         content = safe_truncate(content, 4000)
@@ -241,7 +240,7 @@ def is_manager_election_message(message: str) -> bool:
     if not is_group_broadcast(message):
         return False
 
-    # Explicit opt-out: the broadcast says there is NO manager / leader / election.
+    
     negations = [
         "no manager election", "no manager", "no single leader", "no leader",
         "without a manager", "without manager", "no head", "no boss",
@@ -249,7 +248,7 @@ def is_manager_election_message(message: str) -> bool:
     if any(neg in text for neg in negations):
         return False
 
-    # Real election signals (the bare word "manager" is intentionally NOT enough).
+    
     election_phrases = [
         "manager election", "elect a manager", "elect manager", "select a manager",
         "choose a manager", "pick a manager", "appoint a manager", "need a manager",
@@ -299,7 +298,7 @@ def is_group_work_request(message: str) -> bool:
 
     manager_signals = [
         "i am your manager",
-        "i am your menager",   # handles typo
+        "i am your menager",   
         "as manager",
         "manager says",
         "manager:",
@@ -405,17 +404,11 @@ def is_guaranteed_pass(last_text: str, work_mode: bool) -> bool:
     if is_directed_at_me(last_text):
         return False
     if work_mode and WORK_ENABLED:
-        return False  # handled by the build-session logic instead
+        return False
     if is_group_broadcast(last_text):
-        if is_group_status_request(last_text):
-            return False
-        if is_group_work_request(last_text):
-            # With work disabled the build-session path forces PASS, so we can
-            # skip the model call entirely. With work enabled, let it engage.
-            return not WORK_ENABLED
-        if is_manager_election_message(last_text):
-            return False  # candidate==True case may answer
-        return True  # vague broadcast -> PASS
+        # Every group broadcast now gets at least a short acknowledgement, so always
+        # consult the model. (Manager-election non-candidate is handled above.)
+        return False
     return False
 
 
@@ -474,8 +467,7 @@ def build_final_instruction(
             "selected. Do not write a long protocol unless already selected or explicitly asked."
         )
 
-    # During an active build session, claiming/delivering takes priority over a
-    # plain direct mention so the agent keeps doing real work.
+   
     if work_mode and WORK_ENABLED and not directed_at_me:
         return session_action()
 
@@ -503,9 +495,11 @@ def build_final_instruction(
     if group_work_request:
         if not WORK_ENABLED:
             return (
-                "The latest message is a group work request addressed to all agents, "
-                "but runtime config says WORK_ENABLED=false. Do not claim tasks and do not "
-                "start working. Reply exactly PASS."
+                "The latest message is a group work request addressed to all agents, but "
+                "runtime config says WORK_ENABLED=false, so you must NOT claim tasks or start "
+                "working. Still acknowledge briefly: ONE short, friendly sentence with your "
+                "name/alias (@scd) offering help with code review, debugging, and small tasks. "
+                "Do not reply PASS."
             )
         return session_action()
 
@@ -522,8 +516,11 @@ def build_final_instruction(
 
     if group_broadcast:
         return (
-            "The latest message is a vague group broadcast that does not clearly ask all "
-            "agents for status, capabilities, roster, or acknowledgement. Reply exactly PASS."
+            "The latest message is a group broadcast to all agents (it may just be a greeting "
+            "or general chatter). Reply with ONE short, friendly sentence that acknowledges it, "
+            "states your name/alias (@scd), and offers help with code review, debugging, and "
+            "small code tasks. Do not start any actual work and do not claim tasks. Do not "
+            "reply PASS."
         )
 
     return (
@@ -576,8 +573,7 @@ def ask_model(system_prompt: str, messages: list, important_memory: list,
             "content": f"[{agent_name}]: {content}",
         })
 
-    # Decide based on the message that actually triggered this turn, not just
-    # whatever happens to be last in history (which may be our own past message).
+    
     if trigger_text is not None:
         last_message_text = trigger_text
     elif messages:
@@ -625,8 +621,7 @@ def ask_model(system_prompt: str, messages: list, important_memory: list,
     )
 
     if force_delivery:
-        # The agent has already claimed this subtask in an active, WORK_ENABLED
-        # build session. Bypass the default-silence bias and demand real code.
+       
         final_instruction = (
             f"You are in an ACTIVE build session and you already claimed the subtask "
             f"\"{my_last_task}\". WORK_ENABLED is true, so you are AUTHORIZED to deliver it now "
@@ -707,9 +702,7 @@ def main():
     else:
         log("Startup message skipped.")
 
-    # Prime the cursor so we only react to messages that arrive AFTER startup.
-    # Without this, last_seen=0 replays the whole hub history (including our own
-    # claims from a previous run) and the agent reacts to stale messages.
+
     primer = fetch_messages(last_seen)
     if primer:
         last_seen = primer[-1].get("seq", last_seen)
@@ -750,8 +743,7 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # If this batch contains a direct mention, act on that rather than
-            # whatever happened to arrive last, so we never miss being addressed.
+            
             directed_msgs = [
                 msg for msg in new_messages
                 if is_directed_at_me(msg.get("content", ""))
@@ -759,8 +751,7 @@ def main():
             target_msg = directed_msgs[-1] if directed_msgs else new_messages[-1]
             last_text = target_msg.get("content", "")
 
-            # A group work request (with work enabled) starts/restarts a build
-            # session; after which the agent stays engaged on coordination messages.
+           
             if WORK_ENABLED and is_group_work_request(last_text):
                 if work_mode:
                     log("New build request: resetting session task counters.")
@@ -777,7 +768,7 @@ def main():
 
             can_claim_more = (not pending_delivery) and (tasks_claimed < MAX_TASKS_PER_SESSION)
 
-            # Engage on the usual triggers, or to deliver/claim more in a session.
+            
             engage = (
                 should_call_model(last_text, work_mode)
                 or (work_mode and pending_delivery)
@@ -788,14 +779,14 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Skip the model entirely when the answer is certainly PASS.
+            
             if is_guaranteed_pass(last_text, work_mode):
                 log(f"Last message preview: {last_text[:150]}")
                 log("Guaranteed PASS (no model call), nothing sent.")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Reload config each round so prompt behavior can be tuned live.
+            
             try:
                 system_prompt = load_system_prompt()
             except Exception as e:
@@ -829,8 +820,7 @@ def main():
                 messages_sent += 1
                 log(f"Sent message {messages_sent}/{MAX_MESSAGES_TO_SEND}")
                 upper = reply.upper()
-                # A real delivery must contain actual code, not just a status word.
-                # This stops "[WORKING] not done yet" from being treated as delivered.
+                
                 has_code = "```" in reply
                 delivered = has_code and (
                     "[DONE]" in upper or "[WORKING]" in upper or "[FILE_PROPOSAL]" in upper
@@ -848,14 +838,12 @@ def main():
                     pending_delivery = False
                     log("Delivered claimed task. Will look for the next unclaimed piece.")
 
-                # A bare [CLAIM] only reserves the task; the agent must not then go
-                # silent waiting for someone else to speak. Immediately follow up with
-                # the actual code so a claim is always paired with a delivery.
+              
                 if (pending_delivery and my_tasks
                         and messages_sent < MAX_MESSAGES_TO_SEND
                         and tokens_used < MAX_TOTAL_TOKENS):
                     deliver_task = my_tasks[-1]
-                    # Force the code out; retry once if the model still stalls/PASSes.
+                    
                     for deliver_attempt in range(2):
                         time.sleep(POLL_SECONDS)
                         log(f"Auto-delivering claimed task (attempt {deliver_attempt + 1}/2): "
